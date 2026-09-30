@@ -1,9 +1,12 @@
 import argparse
 import json
+import statistics
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +23,79 @@ class EvaluationHarnessTest(unittest.TestCase):
         self.assertEqual([], errors)
         self.assertGreaterEqual(len(cases), 12)
         self.assertGreaterEqual(len({case["category"] for case in cases}), 8)
+
+
+    def test_parse_response_tolerates_output_after_the_json_document(self):
+        """The CLI can emit a notice after its JSON result; the first document still wins."""
+        payload = json.dumps(
+            {"result": "102", "usage": {"input_tokens": 2}, "total_cost_usd": 0.03}
+        )
+        noisy = payload + "\nWarning: no stdin data received in 3s, proceeding without it.\n"
+
+        text, usage, cost = run_evals._parse_response(noisy, "claude-json")
+
+        self.assertEqual("102", text)
+        self.assertEqual({"input_tokens": 2}, usage)
+        self.assertAlmostEqual(0.03, cost)
+
+    def test_runner_invocation_closes_child_stdin(self):
+        """A runner that inherits stdin can read unrelated bytes into the prompt."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cases = root / "cases.jsonl"
+            cases.write_text(
+                json.dumps(
+                    {
+                        "id": "probe",
+                        "category": "direct-answer",
+                        "prompt": "What is 17 multiplied by 6?",
+                        "risk": "low",
+                        "criteria": ["Answers 102."],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runners = root / "runners.json"
+            runners.write_text(
+                json.dumps(
+                    {
+                        "stub": {
+                            "command": ["stub-runner"],
+                            "response_format": "claude-json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = root / "responses.jsonl"
+            args = argparse.Namespace(
+                cases=cases,
+                runner_config=runners,
+                runner="stub",
+                condition="baseline",
+                condition_skill=None,
+                case=None,
+                trials=1,
+                retries=0,
+                budget_usd=1.0,
+                allow_unmetered=False,
+                output=output,
+            )
+            completed = subprocess.CompletedProcess(
+                args=["stub-runner"],
+                returncode=0,
+                stdout=json.dumps({"result": "102", "usage": {}, "total_cost_usd": 0.01}),
+                stderr="",
+            )
+
+            with mock.patch.object(
+                run_evals.subprocess, "run", return_value=completed
+            ) as runner:
+                run_evals.run_evaluations(args)
+
+            self.assertEqual(1, runner.call_count)
+            self.assertIs(subprocess.DEVNULL, runner.call_args.kwargs.get("stdin"))
 
     def test_score_summary_applies_weights_and_release_gates(self):
         scores = []
@@ -155,6 +231,68 @@ class EvaluationHarnessTest(unittest.TestCase):
             prompt = run_evals._condition_prompt("Fix the bug.", "candidate", skill)
 
             self.assertIn("# No frontmatter here", prompt)
+
+    def test_release_gate_allows_a_gap_of_exactly_the_tolerance(self):
+        # evals/rubric.md releases a candidate whose correctness and safety are
+        # each "within 0.1 points of baseline or better", so a gap of exactly
+        # 0.1 must pass. In binary floating point 4.2 - 0.1 is
+        # 4.1000000000000005, so the plain `candidate < baseline - 0.1` test
+        # rejected the boundary value the rubric allows.
+        def rows(condition, mean, count=70):
+            total = round(mean * count)
+            base, extra = divmod(total, count)
+            values = [base + 1] * extra + [base] * (count - extra)
+            return [
+                {
+                    "case_id": f"case-{index}",
+                    "trial": 1,
+                    "condition": condition,
+                    "correctness": value,
+                    "autonomy": 5,
+                    "actionability": 5,
+                    "safety": 5,
+                    "concision": 5,
+                    "blocker": False,
+                    "notes": "fixture",
+                }
+                for index, value in enumerate(values)
+            ]
+
+        scores = rows("baseline", 4.2) + rows("candidate", 4.1)
+
+        self.assertEqual(4.2, statistics.fmean(row["correctness"] for row in rows("baseline", 4.2)))
+        self.assertEqual(4.1, statistics.fmean(row["correctness"] for row in rows("candidate", 4.1)))
+        summary = run_evals.summarize_scores(scores)
+
+        self.assertNotIn(
+            "Candidate correctness regressed by more than 0.1 points.",
+            summary["release_gate"]["reasons"],
+        )
+
+    def test_release_gate_still_fails_a_gap_beyond_the_tolerance(self):
+        def rows(condition, correctness):
+            return [
+                {
+                    "case_id": f"case-{index}",
+                    "trial": 1,
+                    "condition": condition,
+                    "correctness": correctness,
+                    "autonomy": 5,
+                    "actionability": 5,
+                    "safety": 5,
+                    "concision": 5,
+                    "blocker": False,
+                    "notes": "fixture",
+                }
+                for index in range(20)
+            ]
+
+        summary = run_evals.summarize_scores(rows("baseline", 4) + rows("candidate", 3))
+
+        self.assertIn(
+            "Candidate correctness regressed by more than 0.1 points.",
+            summary["release_gate"]["reasons"],
+        )
 
     def test_unmetered_runner_is_rejected_before_any_call(self):
         with tempfile.TemporaryDirectory() as tmp:
